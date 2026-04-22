@@ -1,0 +1,9 @@
+beautifulsoup4
+camoufox
+curl_cffi
+patchright
+playwright
+python-dotenv
+quart
+requests
+rich
