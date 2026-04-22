@@ -33,6 +33,14 @@ post_lock = threading.Lock()
 file_lock = threading.Lock()
 success_count = 0
 start_time = time.time()
+stop_event = threading.Event()
+runtime_state = {
+    "running": False,
+    "thread_count": 0,
+    "started_at": None,
+    "last_error": None,
+    "success_count": 0,
+}
 
 
 def ensure_runtime_directories(base_path: str | Path = "keys") -> Path:
@@ -41,12 +49,110 @@ def ensure_runtime_directories(base_path: str | Path = "keys") -> Path:
     return runtime_dir
 
 
+def get_runtime_state() -> dict:
+    elapsed = None
+    if runtime_state["started_at"]:
+        elapsed = int(time.time() - runtime_state["started_at"])
+    return {
+        "running": runtime_state["running"],
+        "thread_count": runtime_state["thread_count"],
+        "started_at": runtime_state["started_at"],
+        "elapsed_seconds": elapsed,
+        "last_error": runtime_state["last_error"],
+        "success_count": runtime_state["success_count"],
+        "site_key": config.get("site_key"),
+        "action_id": config.get("action_id"),
+    }
+
+
+def read_accounts_file(base_path: str | Path = "keys") -> list[str]:
+    path = Path(base_path) / "accounts.txt"
+    if not path.exists():
+        return []
+    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def read_sso_file(base_path: str | Path = "keys") -> list[str]:
+    path = Path(base_path) / "grok.txt"
+    if not path.exists():
+        return []
+    return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
 def parse_thread_count(raw_value: str, default: int = 8) -> int:
     try:
         value = int((raw_value or "").strip() or default)
     except (TypeError, ValueError):
         return default
     return value if value > 0 else default
+
+
+def initialize_runtime(thread_count: int = 8):
+    global PROXIES
+    ensure_runtime_directories()
+    PROXIES = resolve_proxies(PROXIES)
+    html = preflight_site_access(proxies=PROXIES)
+    soup = BeautifulSoup(html, "html.parser")
+
+    key_match = re.search(r'sitekey":"(0x4[a-zA-Z0-9_-]+)"', html)
+    if key_match:
+        config["site_key"] = key_match.group(1)
+
+    tree_match = re.search(r'next-router-state-tree":"([^"]+)"', html)
+    if tree_match:
+        config["state_tree"] = tree_match.group(1)
+
+    js_urls = [
+        urljoin(site_url, script["src"])
+        for script in soup.find_all("script", src=True)
+        if "_next/static" in script["src"]
+    ]
+    discovered_action_id = None
+    for js_url in js_urls:
+        try:
+            js_content = requests.get(
+                js_url,
+                proxies=PROXIES,
+                impersonate="chrome120",
+                timeout=20,
+            ).text
+        except Exception:
+            continue
+        match = re.search(r"7f[a-fA-F0-9]{40}", js_content)
+        if match:
+            discovered_action_id = match.group(0)
+            break
+
+    if not discovered_action_id:
+        raise RuntimeError("Could not extract Action ID from Next.js chunks")
+
+    config["action_id"] = discovered_action_id
+    runtime_state["thread_count"] = thread_count
+    return get_runtime_state()
+
+
+def start_registration(thread_count: int = 8):
+    global start_time
+    thread_count = parse_thread_count(str(thread_count), default=8)
+    if runtime_state["running"]:
+        return get_runtime_state()
+    initialize_runtime(thread_count)
+    stop_event.clear()
+    start_time = time.time()
+    runtime_state["running"] = True
+    runtime_state["thread_count"] = thread_count
+    runtime_state["started_at"] = start_time
+    runtime_state["last_error"] = None
+    runtime_state["success_count"] = success_count
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=thread_count)
+    for _ in range(thread_count):
+        executor.submit(register_single_thread)
+    return get_runtime_state()
+
+
+def stop_registration():
+    runtime_state["running"] = False
+    stop_event.set()
+    return get_runtime_state()
 
 
 def _normalize_proxy_url(value: str) -> str:
@@ -199,14 +305,16 @@ def register_single_thread():
         turnstile_service = TurnstileService()
     except Exception as e:
         print(f"[-] Failed to initialize services: {e}")
+        runtime_state["last_error"] = str(e)
         return
 
     final_action_id = config["action_id"]
     if not final_action_id:
         print("[-] Worker exiting: missing Action ID")
+        runtime_state["last_error"] = "missing Action ID"
         return
 
-    while True:
+    while not stop_event.is_set():
         try:
             with requests.Session(impersonate="chrome120", proxies=PROXIES) as session:
                 try:
@@ -239,6 +347,8 @@ def register_single_thread():
 
                 verify_code = None
                 for _ in range(30):
+                    if stop_event.is_set():
+                        return
                     time.sleep(1)
                     content = email_service.fetch_first_email(jwt)
                     if content:
@@ -256,6 +366,8 @@ def register_single_thread():
                     continue
 
                 for attempt in range(3):
+                    if stop_event.is_set():
+                        return
                     task_id = turnstile_service.create_task(site_url, config["site_key"])
                     token = turnstile_service.get_response(task_id)
 
@@ -299,12 +411,13 @@ def register_single_thread():
                             sso = session.cookies.get("sso")
                             if sso:
                                 with file_lock:
-                                    with open("keys/grok.txt", "a") as f:
+                                    with open("keys/grok.txt", "a", encoding="utf-8") as f:
                                         f.write(sso + "\n")
-                                    with open("keys/accounts.txt", "a") as f:
+                                    with open("keys/accounts.txt", "a", encoding="utf-8") as f:
                                         f.write(f"{email}:{password}:{sso}\n")
                                     global success_count
                                     success_count += 1
+                                    runtime_state["success_count"] = success_count
                                     avg = (time.time() - start_time) / success_count
                                     print(f"[+] Registration succeeded: {email} | SSO: {sso[:15]}... | Avg: {avg:.1f}s")
                                 break
@@ -316,6 +429,7 @@ def register_single_thread():
                     time.sleep(5)
 
         except Exception as e:
+            runtime_state["last_error"] = str(e)
             print(f"[-] Worker exception: {str(e)[:50]}")
             time.sleep(5)
 
@@ -331,39 +445,13 @@ def main():
     else:
         print("[*] No proxy configured")
 
-    print("[*] Initializing...")
-    start_url = f"{site_url}/sign-up"
-    with requests.Session(impersonate="chrome120", proxies=PROXIES) as session:
-        try:
-            html = preflight_site_access(proxies=PROXIES)
-            key_match = re.search(r'sitekey":"(0x4[a-zA-Z0-9_-]+)"', html)
-            if key_match:
-                config["site_key"] = key_match.group(1)
-
-            tree_match = re.search(r'next-router-state-tree":"([^"]+)"', html)
-            if tree_match:
-                config["state_tree"] = tree_match.group(1)
-
-            soup = BeautifulSoup(html, "html.parser")
-            js_urls = [
-                urljoin(start_url, script["src"])
-                for script in soup.find_all("script", src=True)
-                if "_next/static" in script["src"]
-            ]
-            for js_url in js_urls:
-                js_content = session.get(js_url).text
-                match = re.search(r"7f[a-fA-F0-9]{40}", js_content)
-                if match:
-                    config["action_id"] = match.group(0)
-                    print(f"[+] Action ID: {config['action_id']}")
-                    break
-        except Exception as e:
-            print(f"[-] Initial scan failed: {e}")
-            return
-
-    if not config["action_id"]:
-        print("[-] Error: Action ID was not found")
+    try:
+        state = initialize_runtime()
+    except Exception as e:
+        print(f"[-] Initialization failed: {e}")
         return
+
+    print(f"[+] Action ID: {state['action_id']}")
 
     try:
         t = int(input("\nThread count (default 8): ").strip() or 8)
@@ -372,9 +460,13 @@ def main():
     t = parse_thread_count(str(t), default=8)
 
     print(f"[*] Starting {t} worker threads...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=t) as executor:
-        futures = [executor.submit(register_single_thread) for _ in range(t)]
-        concurrent.futures.wait(futures)
+    start_registration(t)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n[*] Received stop signal, shutting down workers...")
+        stop_registration()
 
 
 if __name__ == "__main__":
