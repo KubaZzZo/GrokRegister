@@ -1,6 +1,7 @@
 from pathlib import Path
 import sys
 import types
+import pytest
 
 
 def _install_import_stubs():
@@ -23,12 +24,27 @@ def _install_import_stubs():
     g_module = types.ModuleType("g")
     g_module.EmailService = object
     g_module.TurnstileService = object
+    g_module.__path__ = []
     sys.modules.setdefault("g", g_module)
+
+    patchright_module = types.ModuleType("patchright")
+    patchright_async_api_module = types.ModuleType("patchright.async_api")
+    patchright_async_api_module.async_playwright = object()
+    patchright_module.async_api = patchright_async_api_module
+    sys.modules.setdefault("patchright", patchright_module)
+    sys.modules.setdefault("patchright.async_api", patchright_async_api_module)
 
 
 _install_import_stubs()
 
-from grok import ensure_runtime_directories, parse_thread_count, parse_proxy_server, preflight_site_access
+from grok import (
+    _extract_sso_from_storage_state,
+    complete_signup_in_browser_context,
+    ensure_runtime_directories,
+    parse_thread_count,
+    parse_proxy_server,
+    preflight_site_access,
+)
 
 
 def test_ensure_runtime_directories_creates_keys_dir(tmp_path: Path):
